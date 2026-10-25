@@ -1,6 +1,10 @@
 # Plexonauts — backend feed
 
-Live per-user activity feed for the top-down "room" visualization, running
+![Plexonauts demo: viewers drawn as astronauts moving between a video store, lobby and eight theater screens](media/demo.gif)
+
+*Demo mode with simulated users. [MP4 version](media/demo.mp4).*
+
+Live per-user activity feed for the top-down "room" visualization — a retro movie theater where each viewer is an astronaut, running
 against the Ubuntu Plex VM (`user@plex.lan`).
 
 **Status as of 2026-09-13: working and verified against live data on that server.**
