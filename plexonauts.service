@@ -1,0 +1,22 @@
+[Unit]
+Description=Plexonauts feed (http + websocket)
+After=network-online.target plexmediaserver.service tautulli.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/plexonauts
+ExecStart=/usr/bin/python3 /home/user/plexonauts/server.py
+Restart=on-failure
+RestartSec=5
+# reads a world-readable log and talks to localhost services; needs no privilege
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/user/plexonauts
+
+[Install]
+WantedBy=multi-user.target
