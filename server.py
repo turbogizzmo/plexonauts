@@ -35,9 +35,12 @@ import sys
 import threading
 import time
 import http
+import ipaddress
 import mimetypes
+import socket
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -62,7 +65,13 @@ def _load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        v = v.strip()
+        if v[:1] in ('"', "'") and v[0] in v[1:]:
+            v = v[1:v.index(v[0], 1)]
+        else:
+            # unquoted: a "#" at the start or after whitespace begins a comment
+            v = re.sub(r"(^|\s)#.*$", "", v).strip()
+        os.environ.setdefault(k.strip(), v)
 
 
 _load_dotenv(Path(__file__).with_name(".env"))
@@ -85,6 +94,10 @@ class Config:
     browse_ttl: float = float(os.environ.get("BROWSE_TTL", "45"))
     couches: int = int(os.environ.get("COUCHES", "8"))
     demo: bool = os.environ.get("DEMO", "").lower() in ("1", "true", "yes")
+    # Extra Host names / browser Origins to accept, comma separated. See
+    # _host_allowed and _origin_allowed for what is accepted without them.
+    allowed_hosts: str = os.environ.get("ALLOWED_HOSTS", "")
+    allowed_origins: str = os.environ.get("ALLOWED_ORIGINS", "")
 
 
 CFG = Config()
@@ -202,7 +215,8 @@ def plex_sections(base: str, token: str) -> dict[str, str]:
 # art route will serve nothing that is not in here, so it cannot be used to
 # proxy arbitrary Plex paths.
 ART_PATHS: dict[str, str] = {}
-ART_CACHE: dict[str, tuple[str, bytes]] = {}
+ART_CACHE: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
+ART_CACHE_MAX = 120
 
 
 @dataclass
@@ -315,7 +329,7 @@ def tail_log(path: str, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, s
     Follow the Plex log, surviving rotation.
 
     Plex rotates its log every time the server restarts - which now happens
-    automatically via the 4am updater - so a tailer that holds a stale fd goes
+    automatically via the nightly updater - so a tailer that holds a stale fd goes
     permanently deaf without any error. Re-stat the path and compare inodes.
     """
     fh = None
@@ -379,11 +393,17 @@ def tail_log(path: str, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, s
 
 
 STATIC_DIR = Path(__file__).parent
+STATIC_FILES = {"/viewer.html": "viewer.html"}
 
 # Demo mode needs titles and artwork that actually belong together, otherwise
 # it shows one film's backdrop under another film's name. Seed a handful of real
 # library items so the demo exercises the live code path honestly.
 DEMO_CATALOG: list[dict] = []
+# After a failed seed, wait this long before letting a request try again, so
+# repeated /demo/catalog or /art/demoN hits can't keep Plex calls queued.
+SEED_RETRY_SECONDS = 60.0
+_seed_lock = asyncio.Lock()
+_seed_retry_at = 0.0
 
 
 def _seed_demo_catalog(n: int = 48) -> None:
@@ -403,6 +423,9 @@ def _seed_demo_catalog(n: int = 48) -> None:
         if not pools:
             return
         per = max(4, n // len(pools) + 2)
+        # built locally and published at the end: this runs in a worker thread
+        catalog: list[dict] = []
+        paths: dict[str, str] = {}
         for d in pools:
             key = d["key"]
             # totalSize comes back even with a zero-size page, so we can pick a
@@ -425,16 +448,139 @@ def _seed_demo_catalog(n: int = 48) -> None:
                 title = it.get("title", "Unknown")
                 if it.get("type") == "show":
                     title = f"{title} - S1"
-                slot = f"demo{len(DEMO_CATALOG)}"
-                ART_PATHS[slot] = img
-                DEMO_CATALOG.append({"title": title, "art": f"/art/{slot}"})
-        random.shuffle(DEMO_CATALOG)
-        if DEMO_CATALOG:
-            ART_PATHS.setdefault("demo", ART_PATHS[DEMO_CATALOG[0]["art"].rsplit("/", 1)[1]])
+                slot = f"demo{len(catalog)}"
+                paths[slot] = img
+                catalog.append({"title": title, "art": f"/art/{slot}"})
+        random.shuffle(catalog)
+        if catalog:
+            paths.setdefault("demo", paths[catalog[0]["art"].rsplit("/", 1)[1]])
+        ART_PATHS.update(paths)
+        DEMO_CATALOG[:] = catalog
         log.info("demo catalog seeded with %d titles from %d sections",
                  len(DEMO_CATALOG), len(pools))
     except Exception as e:  # noqa: BLE001
         log.warning("demo catalog seed failed: %s", e)
+
+
+async def _ensure_demo_catalog() -> None:
+    """Seed off the event loop, one attempt at a time, with a retry backoff."""
+    global _seed_retry_at
+    if DEMO_CATALOG or time.monotonic() < _seed_retry_at:
+        return
+    async with _seed_lock:
+        if DEMO_CATALOG or time.monotonic() < _seed_retry_at:
+            return
+        await asyncio.to_thread(_seed_demo_catalog)
+        if not DEMO_CATALOG:
+            _seed_retry_at = time.monotonic() + SEED_RETRY_SECONDS
+
+
+def _fetch_art(key: str) -> tuple[str, bytes]:
+    q = urllib.parse.urlencode({
+        "width": 640, "height": 360, "minSize": 1, "upscale": 1,
+        "url": ART_PATHS[key]})
+    # token as a header, not a query parameter, so it stays out of access logs
+    req = urllib.request.Request(
+        f"{CFG.plex_url.rstrip('/')}/photo/:/transcode?{q}",
+        headers={"X-Plex-Token": CFG.plex_token})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.headers.get("Content-Type", "image/jpeg"), r.read()
+
+
+# Host header: a name, IPv4 or bracketed IPv6, optional port. Anything else is
+# rejected before it can be echoed into a response header.
+RE_HOST = re.compile(r"^(?P<name>[a-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?$")
+
+
+def _csv(value: str) -> set[str]:
+    return {x.strip().lower() for x in value.split(",") if x.strip()}
+
+
+def _hostname(hostport: str) -> str | None:
+    m = RE_HOST.match(hostport.strip().lower())
+    return m.group("name").strip("[]").rstrip(".") if m else None
+
+
+# Names that public DNS can't hand out, so a rebinding attacker can't own them:
+# single-label names (plex) and these LAN-only suffixes (plex.lan, plex.local).
+LAN_SUFFIXES = (".localhost", ".local", ".lan", ".home", ".home.arpa",
+                ".internal", ".localdomain")
+
+_OWN_NAMES: set[str] = set()
+
+
+def _own_names() -> set[str]:
+    """This machine's own hostname and FQDN, looked up once."""
+    if not _OWN_NAMES:
+        _OWN_NAMES.add("localhost")
+        for n in (socket.gethostname(), socket.getfqdn()):
+            n = n.strip().lower().rstrip(".")
+            if n:
+                _OWN_NAMES.add(n)
+    return _OWN_NAMES
+
+
+def _host_allowed(hostport: str) -> bool:
+    """
+    DNS-rebinding defence. A rebinding page reaches us under a public domain
+    the attacker controls, so accept only names that can't be one: IP literals
+    (the LAN IP or 127.0.0.1), single-label and LAN_SUFFIXES names, this
+    machine's hostname/FQDN, and ALLOWED_HOSTS ("*" turns the check off).
+    """
+    host = _hostname(hostport)
+    if not host:
+        return False
+    extra = {_hostname(h) or h for h in _csv(CFG.allowed_hosts)}
+    if "*" in extra or host in extra:
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return ("." not in host or host.endswith(LAN_SUFFIXES)
+            or host in _own_names())
+
+
+def _origin_allowed(origin: str | None, hostport: str) -> bool:
+    """
+    Cross-site WebSocket hijacking defence. Browsers always send Origin on a
+    WebSocket upgrade, so a page may connect only from the origin it was served
+    from (the Host it asked for) or an origin listed in ALLOWED_ORIGINS. A
+    missing Origin means a non-browser client and is let through. file://
+    pages send "null"; add null to ALLOWED_ORIGINS to allow them.
+    """
+    if origin is None:
+        return True
+    origin = origin.strip().lower()
+    extra = _csv(CFG.allowed_origins)
+    if "*" in extra or origin in extra:
+        return True
+    u = urllib.parse.urlsplit(origin)
+    return u.scheme in ("http", "https") and u.netloc == hostport.strip().lower()
+
+
+# viewer.html is one self-contained page: inline script and style, Google
+# Fonts, artwork from /art and its feed on the same host. connect-src names
+# ws:// explicitly because older Safari does not match it with 'self'.
+VIEWER_CSP = (
+    "default-src 'none'; script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src https://fonts.gstatic.com; img-src 'self'; "
+    "connect-src 'self' ws://{host} wss://{host}; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
+_REJECTED: set[str] = set()
+
+
+def _forbidden(what: str, value: str):
+    if value not in _REJECTED and len(_REJECTED) < 64:
+        _REJECTED.add(value)
+        log.warning("rejected request with %s %r (see ALLOWED_HOSTS / "
+                    "ALLOWED_ORIGINS)", what, value)
+    return (http.HTTPStatus.FORBIDDEN, [("Content-Type", "text/plain")],
+            f"{what} not allowed\n".encode())
 
 
 async def process_request(path: str, request_headers):
@@ -445,7 +591,14 @@ async def process_request(path: str, request_headers):
     ws:// and http:// share one port - one service to run, one port to open,
     and the page can always reach its own feed with no cross-origin setup.
     """
+    hostport = request_headers.get("Host", "")
+    if not _host_allowed(hostport):
+        return _forbidden("host", hostport)
+
     if request_headers.get("Upgrade", "").lower() == "websocket":
+        origin = request_headers.get("Origin")
+        if not _origin_allowed(origin, hostport):
+            return _forbidden("origin", origin)
         return None
 
     route = urllib.parse.urlparse(path).path
@@ -454,52 +607,56 @@ async def process_request(path: str, request_headers):
     if route.startswith("/art/"):
         key = route[5:]
         if key.startswith("demo") and key not in ART_PATHS:
-            _seed_demo_catalog()
+            await _ensure_demo_catalog()
         if (not key.isdigit() and not key.startswith("demo")) or key not in ART_PATHS:
             return (http.HTTPStatus.NOT_FOUND, [("Content-Type", "text/plain")], b"no art\n")
         if key in ART_CACHE:
+            ART_CACHE.move_to_end(key)
             ctype, body = ART_CACHE[key]
         else:
-            q = urllib.parse.urlencode({
-                "width": 640, "height": 360, "minSize": 1, "upscale": 1,
-                "url": ART_PATHS[key], "X-Plex-Token": CFG.plex_token})
             try:
-                req = urllib.request.Request(
-                    f"{CFG.plex_url.rstrip('/')}/photo/:/transcode?{q}")
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    body = r.read()
-                    ctype = r.headers.get("Content-Type", "image/jpeg")
+                ctype, body = await asyncio.to_thread(_fetch_art, key)
             except Exception as e:  # noqa: BLE001
                 log.warning("art fetch failed for %s: %s", key, e)
                 return (http.HTTPStatus.BAD_GATEWAY,
                         [("Content-Type", "text/plain")], b"art unavailable\n")
-            if len(ART_CACHE) > 120:
-                ART_CACHE.clear()
             ART_CACHE[key] = (ctype, body)
+            while len(ART_CACHE) > ART_CACHE_MAX:
+                ART_CACHE.popitem(last=False)
         return (http.HTTPStatus.OK,
                 [("Content-Type", ctype), ("Content-Length", str(len(body))),
-                 ("Cache-Control", "public, max-age=3600")], body)
+                 ("Cache-Control", "public, max-age=3600"),
+                 ("X-Content-Type-Options", "nosniff")], body)
 
     if route == "/demo/catalog":
-        _seed_demo_catalog()
+        await _ensure_demo_catalog()
         body = json.dumps(DEMO_CATALOG).encode()
         return (http.HTTPStatus.OK,
                 [("Content-Type", "application/json"),
-                 ("Content-Length", str(len(body)))], body)
+                 ("Content-Length", str(len(body))),
+                 ("X-Content-Type-Options", "nosniff")], body)
 
     if route == "/healthz":
         return (http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"ok\n")
 
-    target = (STATIC_DIR / route.lstrip("/")).resolve()
-    if STATIC_DIR.resolve() not in target.parents or not target.is_file():
+    # Only files listed here are served. The app directory also holds .env
+    # (Plex token, Tautulli key), server.py and backups, so never fall back to
+    # serving arbitrary paths from it.
+    name = STATIC_FILES.get(route)
+    if name is None:
         return (http.HTTPStatus.NOT_FOUND, [("Content-Type", "text/plain")], b"not found\n")
 
+    target = STATIC_DIR / name
     ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     body = target.read_bytes()
     return (
         http.HTTPStatus.OK,
         [("Content-Type", ctype), ("Content-Length", str(len(body))),
-         ("Cache-Control", "no-store")],
+         ("Cache-Control", "no-store"),
+         # hostport already passed RE_HOST, so it is safe to echo here
+         ("Content-Security-Policy", VIEWER_CSP.format(host=hostport.strip())),
+         ("X-Content-Type-Options", "nosniff"),
+         ("Referrer-Policy", "no-referrer")],
         body,
     )
 
@@ -570,7 +727,7 @@ async def main() -> None:
         last: dict[str, dict] = {}
         while not stop.is_set():
             try:
-                sessions = [] if CFG.demo else tau.activity()
+                sessions = [] if CFG.demo else await asyncio.to_thread(tau.activity)
                 room.apply_streams(sessions)
             except Exception as e:  # noqa: BLE001
                 log.warning("tautulli poll failed: %s", e)
@@ -593,6 +750,8 @@ async def main() -> None:
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
+
+    _own_names()  # resolve once now, not inside the first request
 
     try:
         server = await websockets.serve(

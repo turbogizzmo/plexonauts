@@ -5,7 +5,7 @@
 *Demo mode with simulated users. [MP4 version](media/demo.mp4).*
 
 Live per-user activity feed for the top-down "room" visualization — a retro movie theater where each viewer is an astronaut, running
-against the Ubuntu Plex VM (`user@plex.lan`).
+against an Ubuntu Plex VM (`<plex-host>`).
 
 **Status as of 2026-09-13: working and verified against live data on that server.**
 
@@ -17,7 +17,7 @@ Yes, and it's a better fit than the original plan assumed. Four of the prompt's
 prerequisites turned out to be already satisfied, and one assumption was wrong in
 a way that would have cost real debugging time.
 
-| Prerequisite | Reality on plex.lan |
+| Prerequisite | Reality on the Plex host |
 |---|---|
 | Debug logging enabled | **Already on** — 23,797 DEBUG lines in the current log |
 | Log path | Correct as written, `/var/lib/plexmediaserver/.../Logs/Plex Media Server.log` |
@@ -100,7 +100,7 @@ Peak viewing hours here are 20:00, 22:00, 19:00 local.
 ### 5. Log rotation must be handled, and now matters more than before
 
 PMS rotates its log on every restart. Since the auto-updater installed on
-2026-09-12 restarts Plex at 4am whenever there's a new release, a tailer holding
+2026-09-12 restarts Plex overnight whenever there's a new release, a tailer holding
 a stale file descriptor goes **permanently deaf with no error**. `tail_log()`
 re-stats the path and compares inodes.
 
@@ -125,14 +125,30 @@ user "active" forever.
 
 ## Viewing it
 
-**Open <http://plex.lan:8787/> from any device on the LAN.** Nothing to install,
+**Open `http://<plex-host>:8787/` from any device on the LAN.** Nothing to install,
 no tunnel.
 
 The page and the WebSocket are served from the **same port** by the same process:
 a non-upgrade request gets `viewer.html`, an upgrade request becomes the feed.
 One service, one port, and the page always reaches its own feed regardless of
 which host or IP you loaded it from — `viewer.html` derives the socket URL from
-`location`, so it works over the LAN, through an ssh tunnel, or from `file://`.
+`location`, so it works over the LAN or through an ssh tunnel.
+
+Requests are checked against a Host allow-list (DNS-rebinding defence) and
+WebSocket upgrades against an Origin allow-list (so other websites cannot read
+the feed). With no configuration it accepts any IP address, `localhost`,
+single-label names, LAN-only names (`.lan`, `.local`, `.home.arpa`, `.internal`,
+`.home`, `.localdomain`) and this machine's own hostname, and the feed accepts
+the page it served. For a public DNS name or a reverse proxy, list the extra
+names in `.env`:
+
+```
+ALLOWED_HOSTS=plex.example.com
+ALLOWED_ORIGINS=https://plex.example.com
+```
+
+Opening `viewer.html` from `file://` sends `Origin: null`; add `null` to
+`ALLOWED_ORIGINS` to allow it. Rejected requests get a 403 and are logged once.
 
 `GET /healthz` returns `ok` for monitoring.
 
@@ -193,8 +209,9 @@ sudo journalctl -u plexonauts -f
 ```
 
 Unit file is `plexonauts.service` in this folder, installed to
-`/etc/systemd/system/`. Runs as `user` (not root), with `NoNewPrivileges`,
-`ProtectSystem=full`, and `ProtectHome=read-only` — it only needs to read a
+`/etc/systemd/system/`. Runs as an unprivileged user (not root), with
+`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome=read-only` and kernel,
+device and capability restrictions — it only needs to read a
 world-readable log and talk to two localhost services.
 
 `run.sh` is still there for foreground debugging; stop the unit first.
@@ -205,16 +222,16 @@ and neither has been printed.
 
 ### Exposure — read this once
 
-`BIND_HOST=0.0.0.0`, so the page is reachable by anything on the LAN, and `ufw`
-is inactive on that box. The feed pairs **real usernames with what they are
-currently watching**. Anyone who can reach `plex.lan:8787` can read it, and
-there is no authentication.
+The feed pairs **real usernames with what they are currently watching**, and
+there is no authentication. With `BIND_HOST=0.0.0.0` anyone who can reach
+port 8787 can read it. The Host and Origin checks stop other websites from
+reading it through a visitor's browser, but not a device on the LAN.
 
-That is a deliberate choice for a home LAN, not an oversight. If it ever needs
-narrowing, the options in increasing order of effort are: enable `ufw` and allow
-8787 only from the trusted subnet; put it behind a reverse proxy with basic auth;
-or set `BIND_HOST=127.0.0.1` and reach it through an ssh tunnel
-(`ssh -N -L 8787:127.0.0.1:8787 user@plex.lan`).
+That is a deliberate choice for a home LAN, not an oversight. To narrow it, the
+options in increasing order of effort are: allow 8787 only from the trusted
+subnet in the host firewall; put it behind a reverse proxy with auth and TLS;
+or keep the default `BIND_HOST=127.0.0.1` and reach it through an ssh tunnel
+(`ssh -N -L 8787:127.0.0.1:8787 <user>@<plex-host>`).
 
 ---
 
@@ -334,7 +351,7 @@ the environment where it was built. Bring it here and I'll wire it up.
 Replace the `reassignAll()` / `setInterval` mock loop with:
 
 ```js
-const ws = new WebSocket("ws://plex.lan:8787");   // localhost if served from the VM
+const ws = new WebSocket("ws://<plex-host>:8787");   // localhost if served from the VM
 const avatars = new Map();
 
 function place(u) {

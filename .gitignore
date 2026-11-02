@@ -3,3 +3,4 @@
 run.pid
 __pycache__/
 *.before-*
+run.log
