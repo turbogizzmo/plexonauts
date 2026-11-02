@@ -11,11 +11,11 @@ if [ -f "$PIDF" ]; then
 fi
 for _ in $(seq 1 20); do ss -tln 2>/dev/null | grep -q ":8787 " || break; sleep 0.5; done
 if ss -tln 2>/dev/null | grep -q ":8787 "; then echo "  port 8787 still busy, aborting"; exit 1; fi
-setsid nohup python3 server.py > /tmp/act.log 2>&1 &
+setsid nohup python3 server.py > run.log 2>&1 &
 echo $! > "$PIDF"
 for _ in $(seq 1 30); do ss -tln 2>/dev/null | grep -q ":8787 " && break; sleep 0.5; done
 if ss -tln 2>/dev/null | grep -q ":8787 "; then
   echo "  up: pid $(cat $PIDF), listening on 8787"
 else
-  echo "  FAILED to come up:"; sed 's/^/    /' /tmp/act.log | tail -12; exit 1
+  echo "  FAILED to come up:"; sed 's/^/    /' run.log | tail -12; exit 1
 fi
